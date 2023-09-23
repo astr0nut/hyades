@@ -1,0 +1,813 @@
+#!/bin/bash
+#------------------------------------------------------------------------------#
+# Hyades : Shell script to water plants using raspberry pi, along with a
+#          water pump and solenoid valves to channel water through appropriate
+#          channels. See Documentation for further details.
+#
+# Pre-Requisites:
+#          pigpio (GPIO commands for shell)
+#          jq (json parser for shell - only if you are using weather functions)
+#          bc (calculator for shell, required to do simple calculations)
+#          mosquitto-clients (to publish messages over MQTT)
+#
+# Written: 07 May 2017
+# Last   : 17 Mar 2023
+# Author : RM
+#------------------------------------------------------------------------------#
+PATH=/bin:/usr/bin:/usr/local/bin:/home/pi/bin:.
+
+ME=$(basename $0)
+HOST=$(hostname | cut -f1 -d.)
+VERSION=2.0.0
+
+CONFDIR="$HOME/.config/bootes"
+LOCLDIR="$HOME/.local/share/bootes"
+CONFIG=$CONFDIR'/'$ME'.conf'
+HISTFILE=$LOCLDIR'/'$ME'_history'
+HISTSIZE=500
+WTHPFILE=$LOCLDIR'/'$ME'_wcount'
+HYADES_INIT=$(which gpio_init4hyades 2> /dev/null)
+
+LINES=""
+INTRCT="False"
+DRYRUN=""
+WSPORT=0
+PSPORT=0
+RLPORT=0
+RL_TRG=1
+RL_PWN=1
+RL_PWF=0
+MQTT_P="False"
+MQTT_S="False"
+WMODUL="WeatherInp"
+MQTMOD="MosQuiTTo"
+
+LINENAME=""
+TIMENAME=""
+WATRTIME=""
+WTIMINGS=""
+MOISTURE="FALSE"
+OPENWMAP="FALSE"
+WATER_ON="FALSE"
+VALVE_ON="FALSE"
+VALVPORT=0
+API_CODE=""
+LOC_CODE=""
+WEATHSPC=""
+WTHP_TOL=0
+OWM_SITE="http://api.openweathermap.org/data/2.5/forecast/daily?units=metric"
+BROKR_IP="localhost"
+MQTT_PRT=1883
+MQTT_USR=""
+MQTT_PWD=""
+MESG_QOS=1
+INFTMPLT='Information/'$ME'/'$HOST
+WRNTMPLT='Warnings/'$ME'/'$HOST
+INFTOPIC=$INFTMPLT
+WRNTOPIC=$WRNTMPLT
+STOPFILE="$LOCLDIR/stop-$ME"
+MESG_STR=""
+
+WATER="NO"
+
+WJS=""
+
+#------------------------------------------------------------------------------#
+printErr()
+{
+    >&2 echo "ERROR  : $*"
+    MESG_STR="ERROR  : $*"
+    [ ${FUNCNAME[ 1 ]} == "pubMQTT" ]|| pubMQTT "Warning"
+    [ "$INTRCT" == "True" ] && history -w
+
+    exit 255
+}
+printWarn()
+{
+    echo "WARNING: $*"
+    MESG_STR="WARNING: $*"
+    [ ${FUNCNAME[ 1 ]} == "pubMQTT" ]|| pubMQTT "Warning"
+}
+printDebug()
+{
+    echo "DEBUG  : $*"
+}
+printInfo()
+{
+    echo "INFO   : $*"
+}
+showBanner()
+{
+echo "
+$ME v$VERSION
+-------------------------------------------------------------------------------
+Take care of daily watering of your garden
+"
+}
+showHelp()
+{
+    showBanner
+    echo "
+    You should be calling this script from cron. Configuration options such as
+    the time of watering (several times per day is possible), duration of water
+    supply, etc. are available in the configuration file:
+
+    $CONFIG
+
+    Edit this file as per your liking and let the script handle the task. The
+    configuration file is well documented internally.
+
+    Listed below is a summary of available command line options:
+
+    -h|--help       : Show this message
+
+    -d|--dryrun     : Dry run. Will keep printing informative messages without
+                      actually doing any watering. Useful if you are debugging
+                      stuff like checking which GPIO port is used for each task.
+
+    -i|--interactive: Interactive mode where you can do individual tasks
+                      yourself. WARNING: Do this only if you know your stuff.
+                      For assistance, invoke this mode and call for help. you
+                      may also read the documentation ;)
+
+    -c|--conf=<file>: Read configuration settings from <file>, instead of the
+                      default config file.
+
+    "
+    exit 0
+}
+showIHelp()
+{
+    echo "
+    Quick summary of usage
+        1. Get configuration and water a LINE :
+              getLine <LINENAME>
+              waterPlants
+
+           Would read configuration parameters for <LINENAME> and water Plants
+
+        2. Read configurations, view and redefine stuff before watering:
+              getLine <LINENAME>
+              listVariables
+              export DURATION=5
+              waterPlants
+
+        Take a look at the documentation for more :)
+
+    "
+}
+checkNumeric()
+{
+    [ "$1" -eq "$1" ] 2> /dev/null || printErr "Expected an integer $2"
+}
+checkPort()
+{
+    local S_PORT=0
+    local E_PORT=28
+    [ -z $3 ]|| S_PORT=$3
+    [ -z $4 ]|| E_PORT=$4
+    
+    ERRMSG="Expected an integer > $S_PORT, < $E_PORT for port $2"
+    [[ "$1" =~ ^[0-9]+$ ]] || printErr $ERRMSG
+    [[ "$1" -le  $S_PORT || "$1" -gt $E_PORT ]] && printErr $ERRMSG
+}
+setRelays()
+{
+    local TRG=1
+    
+    [ $RL_TRG -le 0 ] && TRG=0
+    RL_PWN=$TRG
+    RL_PWF=$((1-RL_PWN))
+}
+readConfig()
+{
+    [ -f "$CONFIG" ]|| printErr "Cannot proceed without a configuration file"
+
+    printInfo "Reading from Config file"
+
+    LINES=$(cat $CONFIG | grep ^LINES | cut -d: -f2 | sed -e 's/\s//g')
+    LINES=$(echo $LINES  | tr ',' ' ')
+    local TVAR=''
+    
+    PARAMS="RLPORT PSPORT RL_TRG"
+    for VAR in $PARAMS; do
+        TVAR=$(cat $CONFIG|grep ^$VAR|cut -d: -f2 | sed -e 's/\s//g')
+        [ -z $TVAR ]&& TVAR=0
+        checkPort $TVAR $VAR "-1"
+        eval $VAR=$TVAR
+    done
+
+    TVAR=$(cat $CONFIG|grep ^MQTT_P|cut -d: -f2 | sed -e 's/\s//g')
+        [ -z $TVAR ] || MQTT_P=${TVAR^^}
+    [ "$MQTT_P" == "TRUE" ] && getMQTT
+
+    TVAR=$(cat $CONFIG|grep ^STOPFILE|cut -d: -f2 | sed -e 's/\s//g')
+    [ -z $TVAR ] || STOPFILE=${TVAR^^}
+
+    TVAR=$(cat $CONFIG|grep ^WSPORT|cut -d: -f2 | sed -e 's/\s//g')
+    checkPort $TVAR WSPORT
+    WSPORT=$TVAR
+    setRelays
+
+}
+getLine()
+{
+    if [ -z "$1" ]; then
+       echo "        Usage: getLine <LINENAME>"
+       return 128
+    fi
+    LINE="$1"
+    local TVAR=''
+    # if this is not the first time we are called, 
+    # close any open valve before we redefine VALVPORT.
+    [ $VALVPORT -gt 0 ] && closeValve
+    
+    printInfo "Processing $LINE configuration"
+
+    CHK=$(cat $CONFIG | grep ^$LINE)
+    if [ $? -ne 0 ]; then
+        printWarn "$LINE configuration not found"
+        return 0
+    fi
+
+    LINENAME=$LINE
+
+    TVAR=$(sed "/{/{:1; /}/!{N; b1}; /^$LINE /p}; d" $CONFIG | grep -v \# \
+    | grep VALVPORT)
+    TMP=$(echo $TVAR | cut -d: -f1)
+    TVAR=$(echo ${TVAR/$TMP/} | sed -e 's/://' -e 's/\s//g')
+    [ -z $TVAR ] && printErr "Failed to read VALVPORT"
+    VALVPORT=$TVAR
+    [ $INTRCT == "True" ]&& echo "         VALVPORT = $VALVPORT"
+
+    PARM="MOISTURE OPENWMAP"
+    for VAR in $PARM; do
+        TVAR=$(sed "/{/{:1; /}/!{N; b1}; /^$LINE /p}; d" $CONFIG | \
+        grep -v \# | grep $VAR)
+        TMP=$(echo $TVAR | cut -d: -f1)
+        TVAR=$(echo ${TVAR/$TMP/} | sed -e 's/://' -e 's/\s//g')
+        [ -z $TVAR ] || eval $VAR=${TVAR^^}
+        [ $INTRCT == "True" ]&& echo "         $VAR = ${!VAR}"
+    done
+
+    WTIMINGS=$(sed "/{/{:1; /}/!{N; b1}; /^$LINE /p}; d" $CONFIG | grep -v \# \
+    | grep WTIMINGS)
+    WTIMINGS=$(echo $WTIMINGS  | cut -d: -f2 | sed -e 's/\s//g' | tr ',' ' ')
+    [ $INTRCT == "True" ]&& echo "         WTIMINGS = $WTIMINGS"
+}
+getTimes()
+{
+    if [ -z "$1" ]; then
+       echo "        Usage: getTimes <WTIMING>"
+       return 128
+    fi
+
+    TIME="$1"
+    printInfo "Watering time configuration is $TIME"
+    local TVAR=''
+    
+    CHK=$(cat $CONFIG | grep ^$TIME)
+    if [ $? -ne 0 ]; then
+        printWarn "$TIME configuration not found"
+        WATRTIME="UNDEF"
+        DURATION=0
+        return 0
+    fi
+
+    PARM="WATRTIME DURATION"
+    for VAR in $PARM; do
+        TVAR=$(sed "/{/{:1; /}/!{N; b1}; /^$TIME /p}; d" $CONFIG \
+        | grep -v \# | grep $VAR)
+        TMP=$(echo $TVAR | cut -d: -f1)
+        TVAR=$(echo ${TVAR/$TMP/} | sed -e 's/://' -e 's/\s//g')
+        [ -z $TVAR ] && printErr "Failed to read $VAR from Config file"
+        eval $VAR=${TVAR}
+        [ $INTRCT == "True" ]&& echo "         $VAR = ${!VAR}"
+    done
+    TIMENAME=$TIME
+}
+getWeather()
+{
+    printInfo "Processing Weather input configuration"
+
+    CHK=$(cat $CONFIG | grep ^$WMODUL)
+    if [ $? -ne 0 ]; then
+        printWarn "Weather configuration not found. Cannot check weather info."
+        OPENWMAP="FALSE"
+        return 0
+    fi
+
+    local TVAR=''
+    PARM="LOC_CODE API_CODE ACT_WHEN"
+    for VAR in $PARM; do
+        TVAR=$(sed "/{/{:1; /}/!{N; b1}; /^$WMODUL /p}; d" $CONFIG \
+        | grep -v \# | grep $VAR)
+        TMP=$(echo $TVAR | cut -d: -f1)
+        TVAR=$(echo ${TVAR/$TMP/} | sed -e 's/://' -e 's/\s//g')
+        [ -z $TVAR ] && printErr "Failed to read $VAR from Config file"
+        eval $VAR=${TVAR}
+        [ $INTRCT == "True" ]&& echo "         $VAR = ${!VAR}"
+    done
+
+    [ -z $ACT_WHEN ]&& printErr "Expected a value for parameter ACT_WHEN"
+    case "$ACT_WHEN" in
+        "1")
+            WEATHSPC="extreme"
+            ;;
+        "2")
+            WEATHSPC="heavy|extreme"
+            ;;
+        "3")
+            WEATHSPC="moderate|heavy|extreme"
+            ;;
+        "4")
+            WEATHSPC="light|moderate|heavy|extreme"
+            ;;
+        "*")
+            printErr "Unrecognized value '$ACT_WHEN' for ACT_WHEN"
+            ;;
+    esac
+    [ $INTRCT == "True" ]&& echo "                    ($WEATHSPC rain)"
+
+    WTHP_TOL=$(sed "/{/{:1; /}/!{N; b1}; /^$WMODUL /p}; d" $CONFIG | \
+    grep -v \# | grep WTHP_TOL)
+    WTHP_TOL=$(echo $WTHP_TOL  | cut -d: -f2 | sed -e 's/\s//g')
+    [ $INTRCT == "True" ]&& echo "         WTHP_TOL = $WTHP_TOL"
+}
+getMQTT()
+{
+    printInfo "Processing MQTT input parameters"
+    
+    CHK=$(cat $CONFIG | grep ^$MQTMOD)
+    if [ $? -ne 0 ]; then
+        printWarn "MQTT configuration not found. Disabling MQTT"
+        MQTT_P="False"
+        return 0
+    fi
+
+    local TVAR=''
+    PARM="BROKR_IP MQTT_PRT MESG_QOS"
+    for VAR in $PARM; do
+        TVAR=$(sed "/{/{:1; /}/!{N; b1}; /^$MQTMOD /p}; d" $CONFIG \
+        | grep -v \# | grep $VAR)
+        if [ "$(echo $TVAR | sed -e 's/\s//g')" != "" ]; then
+            TMP=$(echo $TVAR | cut -d: -f1)
+            TVAR=$(echo ${TVAR/$TMP/} | sed -e 's/://' -e 's/\s//g')
+            [ -z $TVAR ] && printErr "Failed to read $VAR from Config file"
+            eval $VAR=${TVAR}
+        fi
+        [ $INTRCT == "True" ]&& echo "         $VAR = ${!VAR}"
+    done
+
+    PARM="MQTT_USR MQTT_PWD"
+    for VAR in $PARM; do
+        TVAR=$(sed "/{/{:1; /}/!{N; b1}; /^$MQTMOD /p}; d" $CONFIG \
+        | grep -v \# | grep $VAR)
+        if [ "$(echo $TVAR | sed -e 's/\s//g')" != "" ]; then
+            TMP=$(echo $TVAR | cut -d: -f1)
+            TVAR=$(echo ${TVAR/$TMP/} | sed -e 's/://' -e 's/\s//g')
+            [ -z $TVAR ] || eval $VAR=${TVAR}
+        fi
+        [ $INTRCT == "True" ]&& echo "         $VAR = ${!VAR}"
+    done
+
+    TVAR=$(sed "/{/{:1; /}/!{N; b1}; /^$MQTMOD /p}; d" $CONFIG | grep -v \# \
+    | grep INFTOPIC)
+    TMP=$(echo $TVAR | cut -d: -f1)
+    TVAR=$(echo ${TVAR/$TMP/} | sed -e 's/://' -e 's/\s//g')
+    [ "$TVAR" == "" ]|| eval INFTMPLT=$TVAR
+    [ $INTRCT == "True" ]&& echo "         INFTOPIC = $INFTMPLT"
+    TVAR=$(sed "/{/{:1; /}/!{N; b1}; /^$MQTMOD /p}; d" $CONFIG | grep -v \# \
+    | grep WRNTOPIC)
+    TMP=$(echo $TVAR | cut -d: -f1)
+    TVAR=$(echo ${TVAR/$TMP/} | sed -e 's/://' -e 's/\s//g')
+    [ "$TVAR" == "" ]|| eval WRNTMPLT=$TVAR
+    [ $INTRCT == "True" ]&& echo "         WRNTOPIC = $WRNTMPLT"
+}
+write2GPIO()
+{
+    PORT=$(echo $1 | sed -e 's/\s//g')
+    VALU=$(echo $2 | sed -e 's/\s//g')
+
+    if [ -z $PORT ]||[ -z $VALU ]; then
+        echo "        Usage: write2GPIO <PORT> <VALUE>"
+        return 128
+    fi
+
+    if [ $VALU -gt 1 ]||[ $VALU -lt 0 ]; then
+        echo "        Value should be 1 or 0"
+        return 127
+    fi
+
+    if [ "$DRYRUN" == "True" ]; then
+        printDebug "pigs w $PORT $VALU"
+    else
+        pigs w $PORT $VALU
+        CHK=$(pigs r $PORT)
+        [ $CHK -ne $VALU ] && printErr "Failed to set $VALU on GPIO port $PORT"
+    fi
+}
+readGPIO()
+{
+    if [ -z "$1" ]; then
+        echo "        Usage: readGPIO <PORT>"
+        return 128
+    fi
+
+    PORT=$1
+
+    if [ "$DRYRUN" == "True" ]; then
+        printDebug "pigs r $PORT"
+    else
+        VALU=$(pigs r $PORT)
+        [ "$VALU" -eq "$VALU" ] 2> /dev/null || printWarn "GPIO value is NaN :("
+    fi
+    [ "$INTRCT" == "True" ] && printInfo "Port Value is $VALU"
+    return $VALU
+}
+relayOn()
+{
+    [ $RLPORT -eq 0 ] && return 0
+    readGPIO $RLPORT
+    if [ $? -ne $RL_PWN ]; then
+        printInfo "[`date +%H:%M:%S`] Powering On the Relay"
+        write2GPIO $RLPORT $RL_PWN
+    fi
+}
+relayOff()
+{
+    [ $RLPORT -eq 0 ] && return 0
+    readGPIO $RLPORT
+    if [ $? -eq $RL_PWN ]; then
+        printInfo "[`date +%H:%M:%S`] Powering Off the Relay"
+        write2GPIO $RLPORT $RL_PWF
+    fi
+
+}
+powerOn()
+{
+    # check if 12V supply is ON or not
+    readGPIO $PSPORT
+    if [ $? -ne $RL_PWN ]; then
+        relayOn
+        printInfo "[`date +%H:%M:%S`] Powering On the 12V supply"
+        write2GPIO $PSPORT $RL_PWN
+        sleep 1
+    fi
+}
+powerOff()
+{
+    readGPIO $PSPORT
+    if [ $? -eq $RL_PWN ]; then
+        relayOn
+        printInfo "[`date +%H:%M:%S`] Powering Off the 12V supply"
+        write2GPIO $PSPORT $RL_PWF
+    fi
+}
+checkMoisture()
+{
+    # TODO: rewrite this function to get data from ESP32, MQTT
+    local ARG="$1"
+}
+checkWeather()
+{
+    # see if we already have the information in local variable
+    CHK=$(echo $WJS | jq '.city.id' 2> /dev/null)
+
+    if [ -z $CHK ]; then
+        getWeather
+
+        URL=${OWM_SITE}"&id="${LOC_CODE}"&APPID="${API_CODE}
+        WJS=$(curl $URL 2> /dev/null)
+
+        if [ $? -ne 0 ]; then
+            printWarn "Failed to fetch weather data. Moving on"
+            return 1
+        fi
+    fi
+
+    which jq 1> /dev/null 2> /dev/null
+    [ "$?" -ne 0 ]&& printErr "Package 'jq' is required to process weather info"
+
+
+    CITY=$(echo $WJS | jq '.city.name' | sed -e 's/\"//g')
+    XPCT=$(echo $WJS | jq '.list[0].weather[0].description' | sed -e 's/\"//g')
+
+    printInfo "$XPCT in $CITY"
+
+    CHK=$(echo $XPCT | grep rain | grep -E $WEATHSPC)
+
+    if [ ! -z $(echo $CHK | sed -e 's/\s//g') ]; then
+
+        if [ ! -z $LINENAME ]; then
+            # We might have to pause watering. First check the count of
+            # previous consecutive sessions where soil was dry
+            touch $WTHPFILE
+            typeset -i COUNT=$(cat $WTHPFILE | grep ^$LINENAME | \
+                               cut -d: -f2   | sed -e 's/\s//g')
+            typeset -i WTHP_TOL=$(echo $WTHP_TOL)
+
+            if [ $COUNT -lt $WTHP_TOL ]; then
+                # we are below the tolerance limit.
+                # Pay attention to weather forecast
+                printInfo "Will pause watering for now"
+                WATER="NO"
+                COUNT=$((COUNT+1))
+            else
+                # If we are crossing the tolerance limit,
+                # ignore the weather forecast and water the plants.
+                printInfo "Soil has been dry for the past $WTHP_TOL sessions"
+                printInfo "Will not pause watering anymore"
+                WATER="YES"
+                COUNT=0
+            fi
+        fi
+
+        # update the file that keep a count
+        sed -i "s,^\($LINENAME : \).*,\1"$COUNT',' $WTHPFILE
+    fi
+    TSTAMP=$(date +%H:%M:%S)
+    INFTOPIC=${INFTMPLT}"/Weather"
+    MESG_STR="[$XPCT]"
+    pubMQTT
+}
+openValve()
+{
+    powerOn
+    checkPort $VALVPORT "VALVPORT in $LINENAME"
+    TSTAMP=$(date +%H:%M:%S)
+    printInfo "[$TSTAMP] Opening Valve"
+    INFTOPIC=${INFTMPLT}"/$LINENAME/Valve"
+    MESG_STR="ON"
+    pubMQTT
+    write2GPIO $VALVPORT $RL_PWN
+    VALVE_ON="TRUE"
+    sleep 1
+}
+closeValve()
+{
+    [ "$VALVE_ON" == "TRUE" ]|| return 0
+    checkPort $VALVPORT "VALVPORT in $LINENAME"
+    TSTAMP=$(date +%H:%M:%S)
+    printInfo "[$TSTAMP] Closing Valve"
+    INFTOPIC=${INFTMPLT}"/$LINENAME/Valve"
+    MESG_STR="OFF"
+    pubMQTT
+    write2GPIO $VALVPORT $RL_PWF
+    VALVE_ON="FALSE"
+    sleep 1
+}
+waterOn()
+{
+    checkPort $WSPORT "WSPORT"
+    powerOn
+    relayOn
+    TSTAMP=$(date +%H:%M:%S)
+    printInfo "[$TSTAMP] Turning On the water supply"
+    INFTOPIC=${INFTMPLT}"/Pump"
+    MESG_STR="ON"
+    pubMQTT
+    write2GPIO $WSPORT $RL_PWN
+    WATER_ON="TRUE"
+}
+waterOff()
+{
+    checkPort $WSPORT "WSPORT"
+    [ "$WATER_ON" == "TRUE" ]|| return 0
+    relayOn
+    TSTAMP=$(date +%H:%M:%S)
+    printInfo "[$TSTAMP] Turning Off the water supply"
+    INFTOPIC=${INFTMPLT}"/Pump"
+    MESG_STR="OFF"
+    pubMQTT
+    write2GPIO $WSPORT $RL_PWF
+    WATER_ON="FALSE"
+}
+waterPlants()
+{
+    DURATION=$(echo $DURATION | tr ',' ' ')' 0'
+
+    COUNT=1
+
+    for DUR in $DURATION; do
+        checkNumeric $DUR "for $LINENAME-Duration. Found $DUR"
+        if [ $DUR -gt 0 ]; then
+            openValve
+            printInfo "Step $COUNT: $DUR seconds"
+            waterOn
+            sleep $DUR
+            waterOff
+            closeValve
+            COUNT=$(($COUNT + 1))
+        else
+            DUR=$(echo $DUR | sed -e 's/-//')
+            if [ $DUR -gt 0 ]; then
+                printInfo "Waiting $DUR seconds"
+                sleep $DUR
+            fi
+        fi
+    done
+}
+pubMQTT()
+{
+    PB_TOPIC="$INFTOPIC"
+    [ "$1" == "Warning" ] && PB_TOPIC="$WRNTOPIC"
+    [ "$MQTT_P" == "TRUE" ]|| return 0
+
+    which mosquitto_pub 1> /dev/null 2> /dev/null
+    [ "$?" -ne 0 ]&& printErr "Please install the package 'mosquitto-clients'
+    Or set MQTT_P as 'false' in the config file"
+
+    AUTH_STR=""
+    if [ -n "$MQTT_USR" ]; then
+        AUTH_STR="-u $MQTT_USR"
+        [ -n "$MQTT_PWD" ]&& AUTH_STR="$AUTH_STR -P $MQTT_PWD "
+    fi
+
+    mosquitto_pub -t $PB_TOPIC \
+                  -h $BROKR_IP \
+                  -q $MESG_QOS \
+                  -i $ME       \
+                  -p $MQTT_PRT \
+                     $AUTH_STR \
+                  -m "$MESG_STR" 1> /dev/null 2> /dev/null
+
+    [ "$?" -ne 0 ]&& printWarn "Failed to publish through MQTT"
+}
+cleanup()
+{
+    MESG_STR="Idle"
+    INFTOPIC=$INFTMPLT"/Status"
+    pubMQTT
+
+    printInfo "Switching all ports to idle state"
+    waterOff
+    closeValve
+    powerOff
+    relayOff
+    printInfo "`date` Closing Down"
+    exit 0
+}
+showLines()
+{
+    if [ -z "$LINES" ]; then
+        printInfo "No watering lines were found in the configuration"
+    else
+        printInfo "Available watering lines"
+        for LINE in $LINES; do
+            echo "         $LINE"
+        done
+    fi
+}
+listParameters()
+{
+    scriptVARS="CONFIG \
+    LINENAME DURATION WATRTIME OPENWMAP MOISTURE VALVPORT \
+    RLPORT WSPORT PSPORT"
+
+    for VAR in $scriptVARS; do
+        echo "         $VAR = ${!VAR}"
+    done
+}
+#-----------------------------------------------------------------------------#
+
+CMDINP=`getopt -n $ME -o hdic: -l help,debug,interactive,conf: -- "$@"`
+eval set -- "$CMDINP"
+
+MESG_STR="$ME"
+
+while true; do
+    case "$1" in
+        -h|--help)
+            showHelp
+            shift
+            ;;
+        -d|--dryrun)
+            DRYRUN="True"
+            MESG_STR="$MESG_STR [DRY-RUN]"
+            shift
+            ;;
+        -i|--interactive)
+            INTRCT="True"
+            MESG_STR="$MESG_STR [Interactive]"
+            shift
+            ;;
+        -c|--conf)
+            CONFIG="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            showHelp
+            shift
+            ;;
+    esac
+done
+
+#-----------------------------------------------------------------------------#
+
+printInfo "`date` $ME v$VERSION Starting up"
+
+which pigs 1> /dev/null 2> /dev/null
+[ "$?" -ne 0 ]&& printErr "pigpio not found - required to control gpio pins"
+which bc 1> /dev/null 2> /dev/null
+[ "$?" -ne 0 ]&& printErr "Package 'bc' is not installed"
+[ -x "$HYADES_INIT" ]&& $HYADES_INIT
+
+readConfig
+
+[ -d $LOCLDIR ]|| mkdir -p $LOCLDIR
+[ "$?" -ne 0 ]&& printWarn "Failed to create history file"
+
+trap 'printErr Giving up' SIGINT SIGQUIT
+
+MESG_STR="Working"
+INFTOPIC=$INFTMPLT"/Status"
+pubMQTT
+
+if [ -f "$STOPFILE" ]; then
+    printInfo "STOP FILE detected. $ME stops right here"
+    cleanup
+fi
+    
+if [ "$INTRCT" == "True" ]; then
+    printInfo "Entering Interactive mode"
+
+    history -r
+
+    while true; do
+
+        read -ep "$ME: > " hydCmd
+        [ -n "$hydCmd" ] && history -s $hydCmd
+
+        case "$hydCmd" in
+            exit)
+                history -w
+                break 2
+                ;;
+            help)
+                showIHelp
+                ;;
+            *)
+                hydCmd=$(echo $hydCmd | sed -e 's/\s=\s/=/g')
+                $hydCmd
+                ;;
+        esac
+    done
+else
+
+    readConfig
+    NOW=$(date '+%s')
+
+    for LINE in $LINES; do
+        getLine $LINE
+
+        [ -z "$WTIMINGS" ]&& break
+
+        for WTIME in $WTIMINGS; do
+            getTimes $WTIME
+
+            WATER="NO"
+            INT=1
+
+            if [[ $WATRTIME == *['/']* ]]; then
+                INT=$(echo $WATRTIME | cut -d/ -f2)
+                WATRTIME=$(echo $WATRTIME | cut -d/ -f1)
+            fi
+
+            TST=$(date "+%H:%M:%S" -d $WATRTIME 1> /dev/null 2> /dev/null)
+            [ "$?" -eq 0 ] || continue
+
+            WAT=$(date -d "today $WATRTIME" '+%s')
+            DIFF=$( echo "$NOW - $WAT" | bc )
+
+
+            if [ $DIFF -lt 1799 -a $DIFF -gt 0 ]; then
+
+                DNUM=$(echo "`date +%d` * 1" | bc)
+
+                if [ $(( $DNUM % $INT )) -eq 0 ]; then
+                    WATER="YES"
+                    # Check if moisture need to be analysed.
+                    [ $MOISTURE == "TRUE" -a $WATER == "YES" ]&& checkMoisture
+
+                    # openweathermap prediction
+                    [ $OPENWMAP == "TRUE" -a $WATER == "YES" ]&& checkWeather
+
+                fi
+                break
+            fi
+        done
+
+        if [ $WATER == "YES" ]; then
+            printInfo "Time to do some watering"
+            waterPlants
+        else
+            printInfo "Nothing to do"
+        fi
+    done
+fi
+cleanup
